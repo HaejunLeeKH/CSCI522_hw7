@@ -1,0 +1,296 @@
+#!/usr/bin/env python
+import argparse # optparse is deprecated
+from itertools import islice # slicing for iterators
+import sys
+from fractions import Fraction
+import math
+ 
+def word_matches(h, ref):
+    return sum(1 for w in h if w in ref)
+
+def ngrams(sequence, n):
+    # sequence: sequence of words, list
+    # n: degree of ngrams
+
+    iter_seq = iter(sequence)
+    history = []
+    # make first n-1 elements ready
+    while n > 1:
+        history.append(next(iter_seq))
+        n -= 1
+    # print(history)
+    # print(sequence)
+
+    # add Nth element, yield, and get rid of first element
+    # repeat the process
+    for item in iter_seq:
+        # print(item)
+        history.append(item)
+        # print(tuple(history))
+        yield tuple(history)
+        del history[0]
+
+
+def precision(ref, hypo, n):
+    # only 1 reference is used in our case
+    # ref: reference sentence. list
+    # hypo: hypothesis. list
+    # n: degree of ngram
+
+    from collections import Counter
+
+    # get and count ngrams in hypothesis
+    counts = Counter(ngrams(hypo, n))
+    # if there is none, then precision will be zero
+    if not counts:
+        return Fraction(0)
+    # get ngrams of reference and count their appearance.
+    # since we have only 1 reference, don't need extra work than this.
+    max_counts = Counter(ngrams(ref, n))
+    # for each ngrams of hypothesis, find their number of appearances
+    # from max_counts, which is from reference.
+    clipped_counts = {ngram: min(count, max_counts[ngram]) for ngram, count in counts.items()}
+    # return modified precision = sum of intersection appearances divided by
+    # sum of candidate appearances
+    return Fraction(sum(clipped_counts.values()), sum(counts.values()))
+    # return float(sum(clipped_counts.values()))/ float(sum(counts.values()))
+
+
+def geo_mean(iterable):
+    # iterable: list of precisions
+    import numpy as np
+    a = np.array(iterable)
+    # multiply precisions and do root operation according to how many they are
+    return a.prod()**(1.0/len(a))
+
+
+def brevity_penalty(c, r):
+    # c: length of candidate
+    # r: length of reference
+    # if c is longer than r, return 1
+    # otherwise, return penalty
+    import math
+    if c > r:
+        bp = 1
+    else:
+        bp = math.exp(1-(float(r)/c))
+    return bp
+
+
+def simple_bleu(ref, hypo, n_start, n_ned):
+
+    # get precisions of from 1 gram to ngrams. for range, need to use n+1
+    pcs = [precision(ref, hypo, i) for i in range(n_start, n_ned+1)]
+    #pcs = smoothing(pcs)
+
+    # return multiplication of geometric mean of precisions and
+    # brevity penalty
+    return geo_mean(pcs) * brevity_penalty(len(hypo), len(ref))
+
+
+def bleu_weight(ref, hypo, n_start, n_ned, ws):
+
+    # get precisions of from 1 gram to ngrams. for range, need to use n+1
+    #print('bleu weight')
+    pcs = [precision(ref, hypo, i) for i in range(n_start, n_ned+1)]
+    #print('before', pcs)
+    pcs = [a * b for a, b in zip(pcs, ws)]
+    #print('after', pcs)
+    return geo_mean(pcs) * brevity_penalty(len(hypo), len(ref))
+
+
+def smoothing(pcs):
+    return [Fraction(p_i.numerator + 1, p_i.denominator + 1)
+            for p_i in pcs]
+
+
+def chen_and_cherry(references, hypothesis, p_n, hyp_len,
+                    smoothing=0, epsilon=0.1, alpha=5, k=5):
+    """
+    Boxing Chen and Collin Cherry (2014) A Systematic Comparison of Smoothing
+    Techniques for Sentence-Level BLEU. In WMT14.
+    """
+    # No smoothing.
+    if smoothing == 0:
+        return p_n
+    # Smoothing method 1: Add *epsilon* counts to precision with 0 counts.
+    if smoothing == 1:
+        return [Fraction(p_i.numerator + Fraction(epsilon), p_i.denominator)
+                if float(p_i.numerator) == float(0) else p_i for p_i in p_n]
+        #new_pn = []
+        #import Rational
+    # Smoothing method 2: Add 1 to both numerator and denominator (Lin and Och 2004)
+    if smoothing == 2:
+        return [Fraction(p_i.numerator + 1, p_i.denominator + 1)
+                for p_i in p_n]
+    # Smoothing method 3: NIST geometric sequence smoothing
+    # The smoothing is computed by taking 1 / ( 2^k ), instead of 0, for each
+    # precision score whose matching n-gram count is null.
+    # k is 1 for the first 'n' value for which the n-gram match count is null/
+    # For example, if the text contains:
+    #   - one 2-gram match
+    #   - and (consequently) two 1-gram matches
+    # the n-gram count for each individual precision score would be:
+    #   - n=1  =>  prec_count = 2     (two unigrams)
+    #   - n=2  =>  prec_count = 1     (one bigram)
+    #   - n=3  =>  prec_count = 1/2   (no trigram,  taking 'smoothed' value of 1 / ( 2^k ), with k=1)
+    #   - n=4  =>  prec_count = 1/4   (no fourgram, taking 'smoothed' value of 1 / ( 2^k ), with k=2)
+    if smoothing == 3:
+        incvnt = 1 # From the mteval-v13a.pl, it's referred to as k.
+        for i, p_i in enumerate(p_n):
+            if p_i == 0:
+                incvnt += 1
+                p_n[i] = Fraction(1, 2**incvnt)
+
+        return p_n
+    # Smoothing method 4:
+    # Shorter translations may have inflated precision values due to having
+    # smaller denominators; therefore, we give them proportionally
+    # smaller smoothed counts. Instead of scaling to 1/(2^k), Chen and Cherry
+    # suggests dividing by 1/ln(len(T), where T is the length of the translation.
+    if smoothing == 4:
+        incvnt = 1
+        for i, p_i in enumerate(p_n):
+            if p_i == 0:
+
+                try:
+                    p_n[i] = Fraction(incvnt * k / math.log(hyp_len)) # Note that this K is different from the K from NIST.
+                    incvnt+=1
+                except ZeroDivisionError:
+                    print('hyp_len', hyp_len)
+                    print(hypothesis)
+                    print(references)
+                    print('log hyp_len', math.log(hyp_len))
+                    print('incvnt', incvnt)
+                    print('k', k)
+                    print('result', incvnt * k / math.log(hyp_len))
+                    exit()
+        return p_n
+
+    # Smoothing method 5:
+    # The matched counts for similar values of n should be similar. To a
+    # calculate the n-gram matched count, it averages the n-1, n and n+1 gram
+    # matched counts.
+    if smoothing == 5:
+        m = {}
+        # Requires an precision value for an addition ngram order.
+        p_n_plus5 = p_n + [precision(references, hypothesis, 5)]
+        m[-1] = p_n[0] + 1
+        for i, p_i in enumerate(p_n):
+            p_n[i] = (m[i-1] + p_i + p_n_plus5[i+1]) / 3
+            m[i] = p_n[i]
+        return p_n
+    # Smoothing method 6:
+    # Interpolates the maximum likelihood estimate of the precision *p_n* with
+    # a prior estimate *pi0*. The prior is estimated by assuming that the ratio
+    # between pn and pn-1 will be the same as that between pn-1 and pn-2.
+    if smoothing == 6:
+        for i, p_i in enumerate(p_n):
+            if i in [1,2]: # Skips the first 2 orders of ngrams.
+                continue
+            else:
+                pi0 = p_n[i-1]**2 / p_n[i-2]
+                # No. of ngrams in translation.
+                l = sum(1 for _ in ngrams(hypothesis, i+1))
+                p_n[i] = (p_i + alpha * pi0) / (l + alpha)
+        return p_n
+    # Smoothing method
+    if smoothing == 7:
+        p_n = chen_and_cherry(references, hypothesis, p_n, hyp_len, smoothing=4)
+        p_n = chen_and_cherry(references, hypothesis, p_n, hyp_len, smoothing=5)
+        return p_n
+
+
+def bleu_smooth(ref, hypo, n_start, n_ned, smoothing, epsilon, alpha, k):
+
+    # get precisions of from 1 gram to ngrams. for range, need to use n+1
+    pcs = [precision(ref, hypo, i) for i in range(n_start, n_ned+1)]
+    pcs = chen_and_cherry(ref, hypo, pcs, len(hypo), smoothing, epsilon, alpha, k)
+    #print(pcs)
+    # return multiplication of geometric mean of precisions and
+    # brevity penalty
+    return geo_mean(pcs) * brevity_penalty(len(hypo), len(ref))
+
+
+def main():
+
+    parser = argparse.ArgumentParser(description='Evaluate translation hypotheses.')
+    parser.add_argument('-i', '--input', default='data/hyp1-hyp2-ref',
+            help='input file (default data/hyp1-hyp2-ref)')
+    parser.add_argument('-n', '--num_sentences', default=None, type=int,
+            help='Number of hypothesis pairs to evaluate')
+    parser.add_argument('-a', '--alpha', default=0.1, type=float,
+                        help='Alpha value')
+    parser.add_argument('-ng', '--ngrams', default=4, type=int,
+                        help='degree of ngrams')
+    parser.add_argument('-ng_st', '--ngrams_start', default=1, type=int,
+                        help='start degree of ngrams')
+
+    parser.add_argument('-w1', '--weight1', default=0.25, type=float,
+                        help='weight 1')
+    parser.add_argument('-w2', '--weight2', default=0.25, type=float,
+                        help='weight 2')
+    parser.add_argument('-w3', '--weight3', default=0.25, type=float,
+                        help='weight 3')
+    parser.add_argument('-w4', '--weight4', default=0.25, type=float,
+                        help='weight 4')
+
+    # BLEU smoothing parameter
+    parser.add_argument('-smth', '--smoothing', default=1, type=int,
+                        help='smoothing selection from 0 to 7')
+    parser.add_argument('-eps', '--epsilon', default=0.1, type=float,
+                        help='weight 4')
+    parser.add_argument('-sm_al', '--sm_alpha', default=5, type=float,
+                        help='weight 4')
+    parser.add_argument('-sm_k', '--smth_k', default=5, type=float,
+                        help='weight 4')
+
+    # note that if x == [1, 2, 3], then x[:None] == x[:] == x (copy); no need for sys.maxint
+    opts = parser.parse_args()
+ 
+    # we create a generator and avoid loading all sentences into a list
+    def sentences():
+        with open(opts.input) as f:
+            for pair in f:
+                yield [sentence.strip().split() for sentence in pair.split(' ||| ')]
+ 
+    # note: the -n option does not work in the original code
+    # compare-with-human-evaluation only evaluate first half
+    # but for test later, this code should work whole data set
+
+    ng = opts.ngrams
+    ng_st = opts.ngrams_start
+    weights = [opts.weight1, opts.weight2, opts.weight3, opts.weight4]
+
+    smooth = opts.smoothing
+    epsilon = opts.epsilon
+    sm_alpha = opts.sm_alpha
+    smth_k = opts.smth_k
+    #print('smoothing', smooth)
+
+
+    cnt = 0
+    for h1, h2, ref in islice(sentences(), opts.num_sentences):
+
+        # h1_bleu = simple_bleu(ref, h1, 1, 1)
+        # h2_bleu = simple_bleu(ref, h2, 1, 1)
+        # h1_bleu = simple_bleu(ref, h1, ng_st, ng)
+        # h2_bleu = simple_bleu(ref, h2, ng_st, ng)
+        #h1_bleu = simple_bleu(ref, h1, 1, ng)
+        #h2_bleu = simple_bleu(ref, h2, 1, ng)
+        #h1_bleu = bleu_weight(ref, h1, 1, ng, weights)
+        #h2_bleu = bleu_weight(ref, h2, 1, ng, weights)
+        cnt+=1
+        print(cnt)
+        h1_bleu = bleu_smooth(ref, h1, 1, ng, 4, float(epsilon), sm_alpha, smth_k)
+        h2_bleu = bleu_smooth(ref, h2, 1, ng, smooth, float(epsilon), sm_alpha, smth_k)
+
+
+        print(1 if h1_bleu > h2_bleu else  # \begin{cases}
+              (0 if h1_bleu == h2_bleu
+               else -1))  # \end{cases}
+ 
+# convention to allow import of this file as a module
+if __name__ == '__main__':
+
+    main()
